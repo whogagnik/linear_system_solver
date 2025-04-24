@@ -1,3 +1,5 @@
+# solver/linear_system.py
+
 import math
 import time
 
@@ -48,10 +50,13 @@ class LinearSystemSolver:
         return res, norm
 
     def auto_select_method(self):
+        # Для SPD систем — Cholesky
         if self.is_symmetric() and self.is_positive_definite():
             return self.CHOLESKY
-        if self.is_diagonally_dominant():
+        # Для диагонально-доминируемых больших систем — Gauss-Seidel
+        if self.is_diagonally_dominant() and self.n > 2:
             return self.GAUSS_SEIDEL
+        # Во всех остальных случаях — LU
         return self.LU
 
     def solve(self, method=AUTO, tol=1e-10, max_iter=1000,
@@ -85,31 +90,36 @@ class LinearSystemSolver:
         elif method == self.INVERSE:
             x = self._solve_inverse()
         elif method in iterative:
+            # запускаем итерационный метод, получаем либо x, либо (x, norms)
             try:
                 if method == self.SIMPLE_ITERATION:
-                    x, norms = self._solve_simple_iteration(tol, max_iter, log, x0, collect_norms)
+                    result = self._solve_simple_iteration(tol, max_iter, log, x0, collect_norms)
                 elif method == self.SOR:
-                    x, norms = self._solve_sor(tol, max_iter, log, x0, collect_norms, sor_omega)
+                    result = self._solve_sor(tol, max_iter, log, x0, collect_norms, sor_omega)
                 else:
                     func = {
                         self.JACOBI: self._solve_jacobi,
                         self.GAUSS_SEIDEL: self._solve_gauss_seidel,
                         self.CONJUGATE_GRADIENT: self._solve_conjugate_gradient
                     }[method]
-                    x, norms = func(tol, max_iter, log, x0, collect_norms)
+                    result = func(tol, max_iter, log, x0, collect_norms)
             except RuntimeError:
+                # fallback для простейшей итерации
                 if method == self.SIMPLE_ITERATION:
                     if log:
                         print("Simple iteration failed, falling back to SOR")
-                    x, norms = self._solve_sor(tol, max_iter, log, x0, collect_norms, sor_omega)
+                    result = self._solve_sor(tol, max_iter, log, x0, collect_norms, sor_omega)
                     method = self.SOR
                 else:
                     raise
 
+            # Распаковываем в зависимости от флага collect_norms
             if collect_norms:
+                x, norms = result
                 self.last_norms = norms
                 self.last_method = method
             else:
+                x = result
                 self.last_norms = None
                 self.last_method = None
         else:
@@ -120,11 +130,13 @@ class LinearSystemSolver:
 
         return (x, self.last_norms) if collect_norms and method in iterative else x
 
+    # — Direct methods —
+
     def _solve_gauss(self, eps=1e-12):
         A = [row[:] for row in self.A]
         b = self.b[:]
         for i in range(self.n):
-            pivot = max(range(i,self.n), key=lambda r: abs(A[r][i]))
+            pivot = max(range(i, self.n), key=lambda r: abs(A[r][i]))
             if abs(A[pivot][i]) < eps:
                 raise ValueError("Matrix is singular")
             A[i], A[pivot] = A[pivot], A[i]
@@ -183,7 +195,8 @@ class LinearSystemSolver:
 
     def _solve_inverse(self):
         n = self.n
-        L, U = [[0.0]*n for _ in range(n)], [[0.0]*n for _ in range(n)]
+        L = [[0.0]*n for _ in range(n)]
+        U = [[0.0]*n for _ in range(n)]
         for i in range(n):
             for j in range(i, n):
                 U[i][j] = self.A[i][j] - sum(L[i][k]*U[k][j] for k in range(i))
@@ -194,23 +207,25 @@ class LinearSystemSolver:
         for k in range(n):
             y = [0.0]*n
             for i in range(n):
-                y[i] = ((1.0 if i==k else 0.0) - sum(L[i][j]*y[j] for j in range(i))) / L[i][i]
-            x = [0.0]*n
+                y[i] = ((1.0 if i == k else 0.0) - sum(L[i][j]*y[j] for j in range(i))) / L[i][i]
+            x_col = [0.0]*n
             for i in reversed(range(n)):
-                x[i] = (y[i] - sum(U[i][j]*x[j] for j in range(i+1, n))) / U[i][i]
+                x_col[i] = (y[i] - sum(U[i][j]*x_col[j] for j in range(i+1, n))) / U[i][i]
             for i in range(n):
-                inv[i][k] = x[i]
+                inv[i][k] = x_col[i]
         return [sum(inv[i][j]*self.b[j] for j in range(n)) for i in range(n)]
+
+    # — Iterative methods —
 
     def _solve_jacobi(self, tol, max_iter, log, x0, collect_norms):
         x = x0[:]; norms = []
         for it in range(max_iter):
             x_new = [
-                (self.b[i] - sum(self.A[i][j]*x[j] for j in range(self.n) if j!=i))
+                (self.b[i] - sum(self.A[i][j]*x[j] for j in range(self.n) if j != i))
                 / self.A[i][i]
                 for i in range(self.n)
             ]
-            diff = math.sqrt(sum((x_new[i]-x[i])**2 for i in range(self.n)))
+            diff = math.sqrt(sum((x_new[i] - x[i])**2 for i in range(self.n)))
             if collect_norms: norms.append(diff)
             if log: print(f"Jacobi {it+1}: {diff:.3e}")
             if diff < tol: return (x_new, norms) if collect_norms else x_new
@@ -223,8 +238,8 @@ class LinearSystemSolver:
             for i in range(self.n):
                 s1 = sum(self.A[i][j]*x[j] for j in range(i))
                 s2 = sum(self.A[i][j]*x0[j] for j in range(i+1, self.n))
-                x[i] = (self.b[i] - s1 - s2)/self.A[i][i]
-            diff = math.sqrt(sum((x[i]-x0[i])**2 for i in range(self.n)))
+                x[i] = (self.b[i] - s1 - s2) / self.A[i][i]
+            diff = math.sqrt(sum((x[i] - x0[i])**2 for i in range(self.n)))
             if collect_norms: norms.append(diff)
             if log: print(f"Gauss-Seidel {it+1}: {diff:.3e}")
             if diff < tol: return (x[:], norms) if collect_norms else x[:]
@@ -240,7 +255,7 @@ class LinearSystemSolver:
                 x[i] - tau*(sum(self.A[i][j]*x[j] for j in range(self.n)) - self.b[i])
                 for i in range(self.n)
             ]
-            diff = math.sqrt(sum((x_new[i]-x[i])**2 for i in range(self.n)))
+            diff = math.sqrt(sum((x_new[i] - x[i])**2 for i in range(self.n)))
             if collect_norms: norms.append(diff)
             if log: print(f"SimpleIter {it+1}: {diff:.3e}, tau={tau:.3e}")
             if diff < tol: return (x_new, norms) if collect_norms else x_new
@@ -251,10 +266,10 @@ class LinearSystemSolver:
         x = x0[:]; norms = []
         for it in range(max_iter):
             for i in range(self.n):
-                s = sum(self.A[i][j]*x[j] for j in range(self.n) if j!=i)
-                x_new_i = (self.b[i] - s)/self.A[i][i]
+                s = sum(self.A[i][j]*x[j] for j in range(self.n) if j != i)
+                x_new_i = (self.b[i] - s) / self.A[i][i]
                 x[i] = x[i] + omega*(x_new_i - x[i])
-            diff = math.sqrt(sum((x[i]-x0[i])**2 for i in range(self.n)))
+            diff = math.sqrt(sum((x[i] - x0[i])**2 for i in range(self.n)))
             if collect_norms: norms.append(diff)
             if log: print(f"SOR {it+1}: {diff:.3e}")
             if diff < tol: return (x[:], norms) if collect_norms else x[:]
